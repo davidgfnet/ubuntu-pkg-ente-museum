@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   resolve:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       commit: ${{ steps.r.outputs.commit }}
       tag: ${{ steps.r.outputs.tag }}
@@ -33,7 +33,7 @@ jobs:
   build:
     needs: resolve
     if: needs.resolve.outputs.released == 'false'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         arch: [amd64, arm64]
@@ -96,8 +96,7 @@ jobs:
 
   test:
     needs: build
-    runs-on: ubuntu-24.04
-    container: ubuntu:26.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -105,15 +104,15 @@ jobs:
 
       - run: |
           set -eu
-          apt-get update -qq
-          apt-get install -y -qq ./ente-museum_*_amd64.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ./ente-museum_*_amd64.deb
           ente-museum-gen-keys
           test -d /usr/share/ente-museum/migrations
 
   release:
     needs: [resolve, test]
     if: needs.resolve.outputs.released == 'false'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
@@ -130,4 +129,3 @@ jobs:
           sha256sum ./*.deb > SHA256SUMS
           gh release create "$TAG" ./*.deb SHA256SUMS -R "$GITHUB_REPOSITORY" \
             --title "$TAG" --notes "Built from ente/ente@$COMMIT"
-
