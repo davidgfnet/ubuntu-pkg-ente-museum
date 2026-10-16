@@ -1,0 +1,133 @@
+name: ente-museum
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *" # daily; builds only when Ente's prod commit is new
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.r.outputs.commit }}
+      tag: ${{ steps.r.outputs.tag }}
+      released: ${{ steps.r.outputs.released }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          commit=$(curl -fsS https://api.ente.com/ping | jq -r .id)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          gh api "repos/ente/ente/commits/$commit" --silent   # must exist upstream
+          tag="museum-${commit:0:7}"
+          released=false
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && released=true
+          { echo "commit=$commit"; echo "tag=$tag"; echo "released=$released"; } >> "$GITHUB_OUTPUT"
+          echo "ente/ente@$commit ($tag, released=$released)" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.released == 'false'
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ente/ente
+          ref: ${{ needs.resolve.outputs.commit }}
+          path: ente
+          sparse-checkout: server
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ente/server/go.mod
+          cache: false
+
+      - name: Build
+        working-directory: ente/server
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          go build -trimpath -ldflags "-s -w" -o museum ./cmd/museum
+          go build -trimpath -ldflags "-s -w" -o gen-random-keys ./tools/gen-random-keys
+
+      - name: Package
+        env:
+          ARCH: ${{ matrix.arch }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          set -eu
+          date=$(git -C ente show -s --format=%cd --date=format:%Y%m%d HEAD)
+          version="0~git${date}.${COMMIT:0:7}-1"
+          src=ente/server
+          root=pkg
+
+          install -Dm0755 "$src/museum"          "$root/usr/bin/museum"
+          install -Dm0755 "$src/gen-random-keys" "$root/usr/bin/ente-museum-gen-keys"
+          install -dm0755 "$root/usr/share/ente-museum" "$root/DEBIAN"
+          cp -r "$src"/{configurations,migrations,mail-templates,web-templates} "$root/usr/share/ente-museum/"
+          echo "GIT_COMMIT=$COMMIT" > "$root/usr/share/ente-museum/commit.env"   # systemd EnvironmentFile=
+
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: ente-museum
+          Version: $version
+          Architecture: $ARCH
+          Maintainer: David <david@davidgf.net>
+          Description: Ente server (museum), ente/ente@${COMMIT:0:7}
+          EOF
+
+          dpkg-deb --root-owner-group --build "$root" "ente-museum_${version}_${ARCH}.deb"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deb-${{ matrix.arch }}
+          path: "*.deb"
+          if-no-files-found: error
+
+  test:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deb-amd64
+
+      - run: |
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq ./ente-museum_*_amd64.deb
+          ente-museum-gen-keys
+          test -d /usr/share/ente-museum/migrations
+
+  release:
+    needs: [resolve, test]
+    if: needs.resolve.outputs.released == 'false'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: deb-*
+          merge-multiple: true
+
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          sha256sum ./*.deb > SHA256SUMS
+          gh release create "$TAG" ./*.deb SHA256SUMS -R "$GITHUB_REPOSITORY" \
+            --title "$TAG" --notes "Built from ente/ente@$COMMIT"
+
