@@ -8,12 +8,18 @@ on:
 permissions:
   contents: read
 
+# a manual dispatch overlapping the cron run would otherwise race on gh release create
+concurrency:
+  group: ente-museum
+  cancel-in-progress: false
+
 jobs:
   resolve:
     runs-on: ubuntu-26.04
     outputs:
       commit: ${{ steps.r.outputs.commit }}
       tag: ${{ steps.r.outputs.tag }}
+      date: ${{ steps.r.outputs.date }}
       released: ${{ steps.r.outputs.released }}
     steps:
       - id: r
@@ -23,11 +29,14 @@ jobs:
           set -eu
           commit=$(curl -fsS https://api.ente.com/ping | jq -r .id)
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          gh api "repos/ente/ente/commits/$commit" --silent   # must exist upstream
-          tag="museum-${commit:0:7}"
+          # must exist upstream; commit date (UTC) makes tags sort chronologically
+          ts=$(gh api "repos/ente/ente/commits/$commit" --jq .commit.committer.date)
+          date=$(date -u -d "$ts" +%Y%m%d)
+          [[ "$date" =~ ^[0-9]{8}$ ]]
+          tag="museum-${date}-${commit:0:7}"
           released=false
           gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && released=true
-          { echo "commit=$commit"; echo "tag=$tag"; echo "released=$released"; } >> "$GITHUB_OUTPUT"
+          { echo "commit=$commit"; echo "tag=$tag"; echo "date=$date"; echo "released=$released"; } >> "$GITHUB_OUTPUT"
           echo "ente/ente@$commit ($tag, released=$released)" >> "$GITHUB_STEP_SUMMARY"
 
   build:
@@ -65,10 +74,10 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           COMMIT: ${{ needs.resolve.outputs.commit }}
+          DATE: ${{ needs.resolve.outputs.date }}
         run: |
           set -eu
-          date=$(git -C ente show -s --format=%cd --date=format:%Y%m%d HEAD)
-          version="0~git${date}.${COMMIT:0:7}-1"
+          version="0~git${DATE}.${COMMIT:0:7}-1"
           src=ente/server
           root=pkg
 
